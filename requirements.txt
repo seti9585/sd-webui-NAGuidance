@@ -1,0 +1,2 @@
+# sd-webui-NAGuidance
+# torch は Forge 本体が提供するため個別インストール不要

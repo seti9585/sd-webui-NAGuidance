@@ -1,144 +1,195 @@
 # sd-webui-NAGuidance
 
-**Normalized Attention Guidance (NAG)** for Forge-derived Stable Diffusion WebUIs.
+**EN** | [日本語](#日本語)
 
-A port of the ComfyUI built-in `NAGuidance` node (`comfy_extras/nodes_nag.py`) to the Forge extension format (reForge / Forge Classic / Forge Neo).
+Attention-level guidance extension for Stable Diffusion WebUI (Forge-based).  
+Restores negative guidance by extrapolating in the self-attention output space,  
+independent of the CFG loop — so it works even on distilled / low-CFG sampling.
 
-Paper: [Normalized Attention Guidance (arXiv:2505.21179)](https://arxiv.org/abs/2505.21179)
+Paper: [arXiv:2505.21179](https://arxiv.org/abs/2505.21179)  
+Original implementation: ComfyUI built-in [`comfy_extras/nodes_nag.py`](https://github.com/comfyanonymous/ComfyUI/blob/master/comfy_extras/nodes_nag.py)
 
----
-
-## What it does
-
-NAG restores **negative guidance** by operating directly in the self-attention output space, rather than through the CFG loop. This makes it useful where classifier-free guidance is weak or unavailable:
-
-- **Distilled / few-step models** (Turbo / Lightning / Hyper) where negative prompts barely take effect
-- **Low-CFG or CFG-disabled sampling**, where there is no negative branch for CFG to use
-
-Because NAG works on attention outputs, it is **architecture-agnostic**: it works on both UNet models (SDXL etc.) and flow-matching DiT models (Anima etc.), since it does not depend on the epsilon / velocity prediction space.
-
-It also operates on an **independent axis** from CFG-based guidance extensions (TCFG / SkimmedCFG / MaHiRo / FreSca), so it can be combined with them.
-
----
-
-## Compatibility
-
-| WebUI | Status |
-|---|---|
-| reForge | ✅ Confirmed working |
-| Forge Neo | ✅ Confirmed working |
-| Forge Classic | Expected to work (same hook API) |
-| A1111 | ❌ Not supported (no Forge backend) |
-
-Confirmed on both UNet (SDXL, e.g. Illustrious-based) and DiT (Anima-based) models.
+> Operates on `attn1` output, a separate axis from Pre-CFG / Post-CFG extensions (TCFG / SkimmedCFG / MaHiRo / FreSca). It can be combined with all of them.
 
 ---
 
 ## Installation
 
-### From WebUI
+**Extensions → Install from URL:**
 
-1. Open the **Extensions** tab → **Install from URL**
-2. Paste:
-   ```
-   https://github.com/seti9585/sd-webui-NAGuidance
-   ```
-3. Click **Install**, then **Apply and restart UI**
-
-### Manual
-
-Clone into your WebUI's `extensions` folder:
-
-```bash
-cd stable-diffusion-webui/extensions
-git clone https://github.com/seti9585/sd-webui-NAGuidance
 ```
-
----
-
-## Usage
-
-1. Open the **NAGuidance (Normalized Attention Guidance)** accordion in the txt2img / img2img panel
-2. Check **Enable NAGuidance**
-3. Adjust the parameters and generate
-
-The default values (`5.0 / 0.5 / 1.5`) are a reasonable starting point for most models.
+https://github.com/seti9585/sd-webui-NAGuidance
+```
 
 ---
 
 ## Parameters
 
 | Parameter | Default | Range | Description |
-|---|---|---|---|
-| **NAG Scale** | 5.0 | 0.0 – 50.0 | Guidance strength. Analogous to the CFG scale. Higher = stronger negative guidance. |
-| **NAG Alpha** | 0.5 | 0.0 – 1.0 | Blend ratio between the normalized guided output and the original attention output. `1.0` = full replacement. |
-| **NAG Tau** | 1.5 | 1.0 – 10.0 | Upper clip bound on the L1-norm ratio. Controls how strongly deviation from the manifold is suppressed. |
+| --------- | ------- | ----- | ----------- |
+| **NAG Scale** | 5.0 | 0.0 – 50.0 | Guidance strength. Analogous to the CFG scale. |
+| **NAG Alpha** | 0.5 | 0.0 – 1.0 | Blend ratio between normalized guided output and the original attention output. `1.0` = full replacement. |
+| **NAG Tau**   | 1.5 | 1.0 – 10.0 | Upper clip bound on the L1-norm ratio. Controls how strongly manifold deviation is suppressed. |
+
+The defaults (`5.0 / 0.5 / 1.5`) are a reasonable starting point for most models.
 
 ---
 
-## How it works
+## When to use
 
-NAG is applied to the output of the self-attention (`attn1`) layer:
+NAG restores negative-prompt influence where classifier-free guidance is weak or absent:
+
+- **Distilled / few-step models** (Turbo / Lightning / Hyper) where negative prompts barely take effect
+- **Low-CFG or CFG-disabled sampling**, where there is no negative branch for CFG to use
+
+---
+
+## Algorithm
 
 ```
-z_pos  = attn1 output for the cond  branch
+# Applied to the self-attention (attn1) output
+
+z_pos  = attn1 output for the cond   branch
 z_neg  = attn1 output for the uncond branch
 
-# CFG-style extrapolation, in attention space
-guided = z_pos * nag_scale - z_neg * (nag_scale - 1)
+guided = z_pos × nag_scale − z_neg × (nag_scale − 1)   # CFG-style extrapolation
 
-# L1-norm normalization + tau clip (prevents manifold deviation)
 ratio        = L1norm(guided) / L1norm(z_pos)
-scale_factor = min(ratio, nag_tau) / ratio
-guided_norm  = guided * scale_factor
+scale_factor = min(ratio, nag_tau) / ratio             # L1-norm clip
+guided_norm  = guided × scale_factor
 
-# alpha-blend with the original attention output
-z_final = guided_norm * nag_alpha + z_pos * (1 - nag_alpha)
+z_final = guided_norm × nag_alpha + z_pos × (1 − nag_alpha)   # α-blend
+
+→ z_final overwrites the cond / uncond attention slots
 ```
 
-The result overwrites the attention output, and CFG-1 optimization is disabled so the uncond branch is always evaluated.
+Guidance is extrapolated in attention space, normalized by the L1-norm ratio and clipped at `nag_tau` to prevent deviation from the manifold, then blended back with `nag_alpha`.
 
 ### Hook
-
-NAGuidance registers on the self-attention output patch, completely independent of the Pre-CFG / Post-CFG hooks used by other guidance extensions:
 
 ```python
 unet.set_model_attn1_output_patch(nag_attention_output_patch)
 unet.model_options["disable_cfg1_optimization"] = True
 ```
 
----
-
-## Compatibility with other extensions
-
-NAG runs on its own axis (the attention layer, outside the CFG loop), so it composes with the author's other Forge guidance extensions:
-
-| Extension | Hook | Axis |
-|---|---|---|
-| [sd-webui-TCFG](https://github.com/seti9585/sd-webui-TCFG) | Pre-CFG / Post-CFG | CFG |
-| [sd-webui-SkimmedCFG](https://github.com/seti9585/sd-webui-SkimmedCFG) | Pre-CFG | CFG |
-| [sd-webui-MaHiRo](https://github.com/seti9585/sd-webui-MaHiRo) | Post-CFG | CFG |
-| [sd-webui-FreSca](https://github.com/seti9585/sd-webui-FreSca) | Post-CFG / frequency | CFG |
-| **sd-webui-NAGuidance** | **attn1 output** | **attention (independent)** |
-
-> **Note:** When stacking several CFG-axis extensions at very high CFG values (e.g. CFG ≈ 24) on a UNet backend, the combined per-hook corrections can accumulate and degrade the image. NAG itself is not the cause (it is on a separate axis), but if you stack many guidance extensions, keeping CFG in a moderate range (≈7–10) is recommended.
+NAG forces `disable_cfg1_optimization = True` so the unconditional branch is always evaluated (NAG needs both cond and uncond attention outputs).
 
 ---
 
-## Notes
+## Architecture independence
 
-- NAG forces `disable_cfg1_optimization = True`, so the unconditional branch is always computed. This means a single NAG-enabled pass costs roughly the same as a standard CFG pass even at CFG 1.
-- Parameters are written to the PNG metadata (`NAG Scale` / `NAG Alpha` / `NAG Tau`) for reproducibility.
-
----
-
-## Credits
-
-- Algorithm: *Normalized Attention Guidance* — [arXiv:2505.21179](https://arxiv.org/abs/2505.21179)
-- Reference implementation: ComfyUI built-in `comfy_extras/nodes_nag.py`
+Because NAG operates on **attention outputs**, it does not depend on the epsilon (UNet) or velocity (flow-matching) prediction space.  
+It works on both **UNet models (SDXL etc.)** and **flow-matching DiT models (Anima etc.)** without modification.  
+For DiT models that split img / txt tokens, the `img_slice` branch handles the image-token region.
 
 ---
 
-## License
+## Tested environments
 
-MIT — see [LICENSE](LICENSE).
+- reForge (Python 3.10) — SDXL-family models
+- Forge Neo (Python 3.12) — including Anima, and txt2img + Hires.fix
+
+Not compatible with A1111 (`forge_objects` backend required).
+
+---
+---
+
+# 日本語
+
+**[English](#sd-webui-naguidance)** | 日本語
+
+Forge 系 WebUI 向け attention 層ガイダンス拡張機能。  
+self-attention 出力空間で外挿を行うことでネガティブガイダンスを復元します。  
+CFG ループから独立しているため、蒸留モデルや低 CFG サンプリングでも機能します。
+
+論文: [arXiv:2505.21179](https://arxiv.org/abs/2505.21179)  
+原実装: ComfyUI ビルトイン [`comfy_extras/nodes_nag.py`](https://github.com/comfyanonymous/ComfyUI/blob/master/comfy_extras/nodes_nag.py)
+
+> `attn1` 出力に作用し、Pre-CFG / Post-CFG 系拡張（TCFG / SkimmedCFG / MaHiRo / FreSca）とは別軸で動作します。これらすべてと併用可能です。
+
+---
+
+## インストール
+
+**Extensions → Install from URL:**
+
+```
+https://github.com/seti9585/sd-webui-NAGuidance
+```
+
+---
+
+## パラメータ
+
+| パラメータ | 既定値 | 範囲 | 説明 |
+| --- | --- | --- | --- |
+| **NAG Scale** | 5.0 | 0.0 〜 50.0 | ガイダンス強度。CFG スケールに相当。 |
+| **NAG Alpha** | 0.5 | 0.0 〜 1.0 | 正規化済み guided と元の attention 出力のブレンド比。`1.0` で完全置換。 |
+| **NAG Tau**   | 1.5 | 1.0 〜 10.0 | L1 ノルム比のクリップ上限。マニフォールドからの逸脱抑制の強さ。 |
+
+既定値（`5.0 / 0.5 / 1.5`）はほとんどのモデルで適切な出発点です。
+
+---
+
+## 使いどころ
+
+NAG は CFG が弱い、または機能しない状況でネガティブプロンプトの効果を復元します。
+
+- **蒸留・少ステップモデル**（Turbo / Lightning / Hyper）でネガティブプロンプトがほとんど効かない場合
+- **低 CFG・CFG 無効**のサンプリングで、CFG が使うネガティブ側の枝が存在しない場合
+
+---
+
+## アルゴリズム
+
+```
+# self-attention（attn1）出力に対して適用
+
+z_pos  = attn1 出力のうち cond   側
+z_neg  = attn1 出力のうち uncond 側
+
+guided = z_pos × nag_scale − z_neg × (nag_scale − 1)   # CFG と同形の外挿
+
+ratio        = L1norm(guided) / L1norm(z_pos)
+scale_factor = min(ratio, nag_tau) / ratio             # L1 ノルムクリップ
+guided_norm  = guided × scale_factor
+
+z_final = guided_norm × nag_alpha + z_pos × (1 − nag_alpha)   # α ブレンド
+
+→ z_final で cond / uncond の attention スロットを上書き
+```
+
+attention 空間でガイダンスを外挿し、L1 ノルム比で正規化したうえで `nag_tau` でクリップしてマニフォールドからの逸脱を防ぎ、`nag_alpha` で元の出力と混合します。
+
+### フック
+
+```python
+unet.set_model_attn1_output_patch(nag_attention_output_patch)
+unet.model_options["disable_cfg1_optimization"] = True
+```
+
+NAG は cond / uncond 両方の attention 出力を必要とするため、`disable_cfg1_optimization = True` を設定して uncond の枝が常に評価されるようにします。
+
+---
+
+## アーキテクチャ非依存性
+
+NAG は **attention 出力**に作用するため、epsilon（UNet）／ velocity（フローマッチング）の予測空間に依存しません。  
+**UNet モデル（SDXL 等）**と**フローマッチング系 DiT モデル（Anima 等）**のどちらでも、変更なしで動作します。  
+img / txt トークンを分割する DiT モデルに対しては、`img_slice` 分岐が画像トークン領域を処理します。
+
+---
+
+## 動作確認環境
+
+- reForge（Python 3.10）— SDXL 系モデル
+- Forge Neo（Python 3.12）— Anima を含む。txt2img + Hires.fix も確認
+
+A1111 非対応（`forge_objects` バックエンドが必要）。
+
+---
+
+## ライセンス
+
+MIT License — Based on: [arXiv:2505.21179](https://arxiv.org/abs/2505.21179)  
+Original implementation: ComfyUI built-in `comfy_extras/nodes_nag.py`
